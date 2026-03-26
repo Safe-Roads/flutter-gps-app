@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:io';
+import 'dart:typed_data';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
@@ -15,21 +15,25 @@ class CameraScreen extends StatefulWidget {
 class _CameraScreenState extends State<CameraScreen> {
   CameraController? _controller;
   List<CameraDescription>? cameras;
-  Timer? _timer;
-  Timer? _gpsTimer;
 
-  bool _isCapturing = false;
+  // 🔥 CONTROL FLAGS
+  bool _isProcessing = false;
+  bool _isSending = false;
+  DateTime _lastSent = DateTime.now();
 
   double latitude = 0.0;
   double longitude = 0.0;
+
+  Timer? _gpsTimer;
 
   @override
   void initState() {
     super.initState();
     _initializeCamera();
-    _initLocation(); // 🔥 fetch immediately
+    _initLocation();
   }
 
+  // ================== LOCATION ==================
   Future<void> _initLocation() async {
     try {
       Position pos = await getCurrentLocation();
@@ -38,30 +42,26 @@ class _CameraScreenState extends State<CameraScreen> {
         latitude = pos.latitude;
         longitude = pos.longitude;
       });
-        debugPrint("Initial GPS -> Lat: $latitude, Lon: $longitude");
-      _startLocationUpdates(); // 🔥 start periodic updates AFTER first fetch
+
+      _startLocationUpdates();
     } catch (e) {
-      debugPrint('Initial GPS error: $e');
+      debugPrint('GPS init error: $e');
     }
   }
 
-  // 🚀 GPS FUNCTION
   Future<Position> getCurrentLocation() async {
-    bool serviceEnabled;
-    LocationPermission permission;
-
-    serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
     if (!serviceEnabled) {
       throw Exception('Location services are disabled.');
     }
 
-    permission = await Geolocator.checkPermission();
+    LocationPermission permission = await Geolocator.checkPermission();
     if (permission == LocationPermission.denied) {
       permission = await Geolocator.requestPermission();
     }
 
     if (permission == LocationPermission.deniedForever) {
-      throw Exception('Location permissions are permanently denied.');
+      throw Exception('Location permanently denied.');
     }
 
     return await Geolocator.getCurrentPosition(
@@ -69,7 +69,6 @@ class _CameraScreenState extends State<CameraScreen> {
     );
   }
 
-  // 🔥 UPDATE LOCATION EVERY 5 SECONDS
   void _startLocationUpdates() {
     _gpsTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
       try {
@@ -79,110 +78,112 @@ class _CameraScreenState extends State<CameraScreen> {
           latitude = pos.latitude;
           longitude = pos.longitude;
         });
-
-        debugPrint("Updated GPS -> Lat: $latitude, Lon: $longitude");
       } catch (e) {
         debugPrint('GPS error: $e');
       }
     });
   }
 
-  // 🚀 CAMERA INIT
+  // ================== CAMERA ==================
   Future<void> _initializeCamera() async {
-    try {
-      cameras = await availableCameras();
-      if (cameras != null && cameras!.isNotEmpty) {
-        final rearCamera = cameras!.firstWhere(
-          (camera) => camera.lensDirection == CameraLensDirection.back,
-          orElse: () => cameras![0],
-        );
+    cameras = await availableCameras();
 
-        _controller = CameraController(rearCamera, ResolutionPreset.medium);
-        await _controller!.initialize();
+    final rearCamera = cameras!.firstWhere(
+      (cam) => cam.lensDirection == CameraLensDirection.back,
+      orElse: () => cameras![0],
+    );
 
-        if (mounted) {
-          setState(() {});
-          _startPeriodicCapture();
-        }
-      }
-    } catch (e) {
-      debugPrint('Camera error: $e');
-    }
+    _controller = CameraController(
+      rearCamera,
+      ResolutionPreset.medium,
+      enableAudio: false,
+    );
+
+    await _controller!.initialize();
+
+    if (!mounted) return;
+
+    setState(() {});
+
+    // 🔥 START STREAM
+    _controller!.startImageStream(_processCameraImage);
   }
 
-  // 🔥 FRAME LOOP
-  void _startPeriodicCapture() {
-    _timer = Timer.periodic(const Duration(milliseconds: 800), (_) {
-      if (!_isCapturing) {
-        _captureAndSendFrame();
-      }
-    });
-  }
+  // ================== FRAME PROCESSING ==================
+  void _processCameraImage(CameraImage image) {
+    if (_isProcessing) return;
 
-  Future<void> _captureAndSendFrame() async {
-    if (_controller == null ||
-        !_controller!.value.isInitialized ||
-        _isCapturing) {
-      return;
-    }
+    final now = DateTime.now();
 
-    _isCapturing = true;
+    // 🔥 LIMIT: 1 request every 2 seconds
+    if (now.difference(_lastSent).inMilliseconds < 2000) return;
+
+    _isProcessing = true;
 
     try {
-      final XFile imageFile = await _controller!.takePicture();
-      final File file = File(imageFile.path);
+      final bytes = image.planes[0].bytes;
 
-      _sendFrameToAPI(file); // 🔥 fire and forget
+      // 🔥 PREVENT OVERLAPPING API CALLS
+      if (!_isSending) {
+        _isSending = true;
+        _lastSent = now;
+
+        _sendFrameToAPI(bytes).whenComplete(() {
+          _isSending = false;
+        });
+      }
     } catch (e) {
-      debugPrint('Capture error: $e');
+      debugPrint("Processing error: $e");
     } finally {
-      _isCapturing = false;
+      _isProcessing = false;
     }
   }
 
-  // 🚀 API CALL
-  Future<void> _sendFrameToAPI(File imageFile) async {
+  // ================== API CALL ==================
+  Future<void> _sendFrameToAPI(Uint8List bytes) async {
     try {
-      final uri = Uri.parse('http://YOUR_IP:8000/detect');
+      final uri = Uri.parse('https://yolo-backend-server.onrender.com/detect');
 
       final request = http.MultipartRequest('POST', uri);
 
       request.files.add(
-        await http.MultipartFile.fromPath('file', imageFile.path),
+        http.MultipartFile.fromBytes(
+          'file',
+          bytes,
+          filename: 'frame.jpg',
+        ),
       );
 
       request.fields['latitude'] = latitude.toString();
       request.fields['longitude'] = longitude.toString();
 
-      request
-          .send()
-          .then((response) {
-            debugPrint('Sent: ${response.statusCode}');
-          })
-          .catchError((error) {
-            debugPrint('API error: $error');
-          });
+      final response = await request.send();
+
+      debugPrint("Response: ${response.statusCode}");
     } catch (e) {
-      debugPrint('Request error: $e');
+      debugPrint("API error: $e");
     }
   }
 
+  // ================== DISPOSE ==================
   @override
   void dispose() {
-    _timer?.cancel();
     _gpsTimer?.cancel();
     _controller?.dispose();
     super.dispose();
   }
 
+  // ================== UI ==================
   @override
   Widget build(BuildContext context) {
     if (_controller == null || !_controller!.value.isInitialized) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
+      );
     }
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Live Pothole Detection')),
+      appBar: AppBar(title: const Text('Live Detection')),
       body: Stack(
         children: [
           CameraPreview(_controller!),

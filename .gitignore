@@ -3,7 +3,9 @@ build/
 .dart_tool/
 .flutter-plugins
 .flutter-plugins-dependencies
-.packages
+
+# Env (VERY IMPORTANT)
+.env
 
 # IDE
 .idea/
@@ -12,9 +14,6 @@ build/
 # OS
 .DS_Store
 Thumbs.db
-
-# Dart
-pubspec.lock  # optional (keep if app, remove if library)
 
 # Android
 android/.gradle/
